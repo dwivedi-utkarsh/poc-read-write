@@ -1,30 +1,25 @@
-package tech.vegapay.routingpoc.hybrid;
+package tech.vegapay.routingpoc;
 
 import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import tech.vegapay.readwriteseperationlibrary.annotation.ForceMasterRead;
-import tech.vegapay.readwriteseperationlibrary.annotation.StickyRead;
-import tech.vegapay.routingpoc.UserRepo;
+import tech.vegapay.routingpoc.routing.annotation.ForceMasterRead;
+import tech.vegapay.routingpoc.routing.annotation.StickyRead;
 
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * The service surface exercised by the hybrid test. Each method maps to one
- * scenario in the matrix. Routing intent is expressed using the in-house
- * library's annotations ({@link ForceMasterRead}, {@link StickyRead}); the
+ * Service surface exercised by the routing test. Each method maps to one
+ * scenario in the matrix. Routing intent is expressed using the local
+ * annotations ({@link ForceMasterRead}, {@link StickyRead}); the
  * HintManagerBridgeAspect translates that intent into ShardingSphere
  * HintManager calls.
- *
- * Lives in main (not test) because this is the pattern a consumer service
- * would ship in production — call sites stay annotation-driven, infra
- * picks the engine.
  */
 @Service
 @RequiredArgsConstructor
-public class HybridUserService {
+public class UserService {
 
     private final UserRepo repo;
 
@@ -36,24 +31,24 @@ public class HybridUserService {
     @Transactional
     public String readThenWriteInTx(UUID id) {
         String before = repo.findById(id).orElseThrow(IllegalStateException::new).getServedBy();
-        repo.updateEmail(id, "hybrid-tx-" + UUID.randomUUID() + "@example.com");
+        repo.updateEmail(id, "tx-" + UUID.randomUUID() + "@example.com");
         return before;
     }
 
     @Transactional
     public String lockAndUpdate(UUID id) {
         String before = repo.findByIdForUpdate(id).getServedBy();
-        repo.updateEmail(id, "hybrid-lock-" + UUID.randomUUID() + "@example.com");
+        repo.updateEmail(id, "lock-" + UUID.randomUUID() + "@example.com");
         return before;
     }
 
     /**
-     * No Spring tx. The bridge aspect should observe StickyWriteContext's
+     * No Spring tx. The bridge aspect should observe RoutingContext's
      * recently-updated lastWriteTime (set by StickyWriteRecorderAspect after
      * the UPDATE returned) and pin the subsequent SELECT to primary.
      */
     public String writeThenReadOutsideTx(UUID id, String email) {
-        repo.updateEmail(id, "hybrid-sticky-" + UUID.randomUUID() + "@example.com");
+        repo.updateEmail(id, "sticky-" + UUID.randomUUID() + "@example.com");
         return repo.findByEmail(email).getServedBy();
     }
 

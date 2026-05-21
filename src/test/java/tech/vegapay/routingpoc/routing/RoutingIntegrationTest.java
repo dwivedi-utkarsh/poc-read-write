@@ -1,4 +1,4 @@
-package tech.vegapay.routingpoc.hybrid;
+package tech.vegapay.routingpoc.routing;
 
 import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterEach;
@@ -16,14 +16,12 @@ import org.springframework.test.context.ActiveProfiles;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
-import tech.vegapay.readwriteseperationlibrary.context.RoutingContextHolder;
-import tech.vegapay.readwriteseperationlibrary.context.stickyReadWriteContext.StickyReadContext;
-import tech.vegapay.readwriteseperationlibrary.context.stickyReadWriteContext.StickyWriteContext;
 import tech.vegapay.routingpoc.RoutingPocApplication;
 import tech.vegapay.routingpoc.User;
 import tech.vegapay.routingpoc.UserRepo;
+import tech.vegapay.routingpoc.UserService;
+import tech.vegapay.routingpoc.routing.context.RoutingContext;
 
-import java.lang.reflect.Field;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -31,40 +29,32 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
- * Hybrid run of the 15-scenario routing matrix. ShardingSphere does the
- * routing decisions; the in-house read-write-seperation-library contributes
- * its annotations and sticky-window logic via HintManagerBridgeAspect +
- * StickyWriteRecorderAspect.
+ * ShardingSphere-only run of the 15-scenario routing matrix. No external
+ * library dependency: annotations, sticky-window context, and aspects all
+ * live locally under tech.vegapay.routingpoc.routing. ShardingSphere makes
+ * the routing decisions; the local aspects translate annotation intent and
+ * sticky-window state into HintManager hints.
  *
- * Compare side-by-side with {@link tech.vegapay.routingpoc.ShardingSphereRoutingIntegrationTest}.
- * Scenarios where the expectation differs from that file are the value-add of
- * the hybrid wiring:
- *
- *   - Scenario 8:  REPLICA → PRIMARY (sticky window now active)
- *   - Scenario 12: PRIMARY (annotation, not HintManager call)
- *   - Scenario 13: PRIMARY (annotation, not HintManager call)
- *   - Scenario 14: REPLICA → PRIMARY (JVM-global sticky propagates to @Async)
- *
- * Scenario 5 (@Transactional(readOnly=true)) still routes to PRIMARY — that
- * one needs a config or call-site change, not something the hybrid can fix at
- * the aspect layer.
+ * Scenario 5 (@Transactional(readOnly=true)) routes to PRIMARY — that is a
+ * transactionalReadQueryStrategy=PRIMARY trade-off, not something the aspect
+ * layer can fix.
  */
 @SpringBootTest(classes = {
         RoutingPocApplication.class,
-        HybridRoutingIntegrationTest.ContainersConfig.class
+        RoutingIntegrationTest.ContainersConfig.class
 })
-@Import(HybridTestConfig.class)
+@Import(RoutingTestConfig.class)
 @ActiveProfiles("test")
 @Testcontainers
-class HybridRoutingIntegrationTest {
+class RoutingIntegrationTest {
 
     private static final UUID ALICE = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final String ALICE_EMAIL = "alice@example.com";
 
     // Bob is never mutated by any scenario, so reads against bob's email
     // succeed regardless of which DB serves them — the marker column tells us
-    // which one did. Tests that want to combine a write (to alice) with a
-    // read (for routing-detection purposes) use bob as the read target.
+    // which one did. Tests that combine a write (to alice) with a read (for
+    // routing-detection purposes) use bob as the read target.
     private static final String BOB_EMAIL = "bob@example.com";
 
     @Container
@@ -121,7 +111,7 @@ class HybridRoutingIntegrationTest {
     UserRepo repo;
 
     @Autowired
-    HybridUserService svc;
+    UserService svc;
 
     @Autowired
     @Qualifier("primaryJdbc")
@@ -132,29 +122,14 @@ class HybridRoutingIntegrationTest {
     JdbcTemplate replicaJdbc;
 
     @BeforeEach
-    void resetAliceAndRoutingState() throws Exception {
+    void resetAliceAndRoutingState() {
         primaryJdbc.update("UPDATE users SET email = ? WHERE id = ?", ALICE_EMAIL, ALICE);
-        clearAllRoutingState();
+        RoutingContext.resetAll();
     }
 
     @AfterEach
-    void clearStateBetweenTests() throws Exception {
-        clearAllRoutingState();
-    }
-
-    /**
-     * The library's StickyReadAspect sets StickyReadContext.overrideWindowMs but
-     * never clears it (a known library quirk), and StickyWriteContext.lastWriteTime
-     * is a static JVM-global that bleeds across tests. Reset everything between
-     * tests so each scenario starts from a known clean state.
-     */
-    private static void clearAllRoutingState() throws Exception {
-        RoutingContextHolder.clearForceMaster();
-        StickyReadContext.clear();
-        Field lastWrite = StickyWriteContext.class.getDeclaredField("lastWriteTime");
-        lastWrite.setAccessible(true);
-        lastWrite.setLong(null, 0L);
-        StickyWriteContext.clearRegistration();
+    void clearStateBetweenTests() {
+        RoutingContext.resetAll();
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -205,25 +180,22 @@ class HybridRoutingIntegrationTest {
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // Scenario 5 — @Transactional(readOnly = true) → PRIMARY (UNCHANGED).
+    // Scenario 5 — @Transactional(readOnly = true) → PRIMARY (trade-off).
     //
-    // The hybrid doesn't fix this. ShardingSphere pins every read inside a
-    // JDBC tx to the write DS when transactionalReadQueryStrategy=PRIMARY, and
-    // there is no HintManager call that means "force read DS for this query"
-    // to counteract it. The library, when it owned the routing decision,
-    // honored Spring's readOnly flag and routed to replica; under hybrid it
-    // cannot do that without giving up the write-tx pinning behavior we want
-    // for scenarios 6 and 7.
+    // ShardingSphere pins every read inside a JDBC tx to the write DS when
+    // transactionalReadQueryStrategy=PRIMARY, and there is no HintManager
+    // call that means "force read DS for this query" to counteract it. The
+    // trade-off is intentional: we want write-tx pinning (scenarios 6 and 7).
     //
-    // If this scenario needs to flip, the choices are:
+    // If this scenario needs to flip:
     //   - Change ShardingSphere to transactionalReadQueryStrategy=DYNAMIC
-    //     (and accept the consequences on scenario 6/7);
+    //     (and accept the consequences on scenarios 6/7), OR
     //   - Drop @Transactional(readOnly=true) at the call site and let the
     //     SELECT execute outside any tx (becomes the scenario 1 path).
     // ────────────────────────────────────────────────────────────────────────
     @Test
-    @DisplayName("5: @Transactional(readOnly=true) SELECT → PRIMARY (hybrid does NOT fix this)")
-    void scenario05_readOnlyTx_underHybrid_stillRoutesToPrimary() {
+    @DisplayName("5: @Transactional(readOnly=true) SELECT → PRIMARY (transactional-pinning trade-off)")
+    void scenario05_readOnlyTx_routesToPrimary() {
         assertThat(svc.readInReadOnlyTx(ALICE_EMAIL)).isEqualTo("PRIMARY");
     }
 
@@ -246,18 +218,15 @@ class HybridRoutingIntegrationTest {
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // Scenario 8 — read within sticky window after a committed write outside tx
+    // Scenario 8 — read within sticky window after a committed write outside tx.
     //
-    // Approach D: REPLICA (no sticky concept).
-    // Hybrid:     PRIMARY — StickyWriteRecorderAspect marks the timestamp on
-    //             UPDATE return, HintManagerBridgeAspect sees the recent write
-    //             and pins the subsequent SELECT to write_ds.
-    //
-    // This is the headline fix the hybrid provides.
+    // StickyWriteRecorderAspect marks the timestamp on UPDATE return,
+    // HintManagerBridgeAspect sees the recent write and pins the subsequent
+    // SELECT to write_ds. This is the headline read-your-own-write fix.
     // ────────────────────────────────────────────────────────────────────────
     @Test
-    @DisplayName("8: read after write within sticky window → PRIMARY (fixed by hybrid)")
-    void scenario08_readAfterWriteOutsideTx_underHybrid_routesToPrimary() {
+    @DisplayName("8: read after write within sticky window → PRIMARY")
+    void scenario08_readAfterWriteOutsideTx_routesToPrimary() {
         // Write to alice, read bob. The write seeds lastWriteTime; the read
         // target is bob so the read succeeds regardless of which DB serves it.
         assertThat(svc.writeThenReadOutsideTx(ALICE, BOB_EMAIL)).isEqualTo("PRIMARY");
@@ -300,13 +269,9 @@ class HybridRoutingIntegrationTest {
 
     // ────────────────────────────────────────────────────────────────────────
     // Scenario 12 — @ForceMasterRead annotation → PRIMARY
-    //
-    // Note: under Approach D this scenario required the call site to use
-    // HintManager directly. Under hybrid the annotation does the same job
-    // transparently — call-site code is identical to library-native code.
     // ────────────────────────────────────────────────────────────────────────
     @Test
-    @DisplayName("12: @ForceMasterRead annotation → PRIMARY (no call-site changes)")
+    @DisplayName("12: @ForceMasterRead annotation → PRIMARY")
     void scenario12_forceMasterReadAnnotation_routesToPrimary() {
         assertThat(svc.forceMasterRead(ALICE_EMAIL)).isEqualTo("PRIMARY");
     }
@@ -327,19 +292,15 @@ class HybridRoutingIntegrationTest {
     // ────────────────────────────────────────────────────────────────────────
     // Scenario 14 — @Async read after parent thread wrote.
     //
-    // Approach D: REPLICA (no sticky concept).
-    // Hybrid:     PRIMARY. StickyWriteContext.lastWriteTime is a static
-    //             volatile long — JVM-wide, not ThreadLocal. The async thread
-    //             enters HintManagerBridgeAspect and sees the same lastWriteTime
-    //             the parent thread set; sticky pins the SELECT to primary.
-    //
-    // This is a quiet second win for the hybrid — read-your-own-write
-    // transparently extends to @Async / Kafka consumer threads with no
-    // application code changes.
+    // RoutingContext.lastWriteTime is a static volatile long — JVM-wide, not
+    // ThreadLocal. The async thread enters HintManagerBridgeAspect and sees
+    // the same lastWriteTime the parent thread set; sticky pins the SELECT
+    // to primary. Read-your-own-write transparently extends to @Async /
+    // Kafka consumer threads with no application code changes.
     // ────────────────────────────────────────────────────────────────────────
     @Test
     @DisplayName("14: @Async read after parent write → PRIMARY (sticky is JVM-global)")
-    void scenario14_asyncReadAfterParentWrite_underHybrid_routesToPrimary() throws Exception {
+    void scenario14_asyncReadAfterParentWrite_routesToPrimary() throws Exception {
         svc.plainWriteOutsideTx(ALICE, "s14-" + UUID.randomUUID() + "@example.com");
         String result = svc.asyncReadAfterParentWrote(BOB_EMAIL).get(3, TimeUnit.SECONDS);
         assertThat(result).isEqualTo("PRIMARY");

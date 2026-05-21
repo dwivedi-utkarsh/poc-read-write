@@ -1,4 +1,4 @@
-package tech.vegapay.routingpoc.hybrid;
+package tech.vegapay.routingpoc.routing;
 
 import org.apache.shardingsphere.driver.api.yaml.YamlShardingSphereDataSourceFactory;
 import org.springframework.beans.factory.annotation.Qualifier;

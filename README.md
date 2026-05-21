@@ -1,166 +1,186 @@
-# read-write-routing-poc
+# read-write-routing-poc — `shardingsphere-only` branch
 
-End-to-end POC proving the **hybrid read/write routing approach**:
-the in-house `read-write-seperation-library` keeps the annotation surface
-and sticky-window semantics it already has; Apache ShardingSphere-JDBC
-sits underneath as the actual routing engine.
+End-to-end POC proving that the same 15-scenario routing matrix the `main`
+branch validates against the **hybrid** approach (ShardingSphere on top of
+`read-write-seperation-library`) also passes with **no library dependency at
+all** — ShardingSphere does the routing; a small local package
+(`tech.vegapay.routingpoc.routing`) contributes annotations and the
+sticky-window mechanism.
 
 ## TL;DR
 
-Same annotations engineers use today (`@ForceMasterRead`, `@StickyRead`).
-Same `StickyWriteContext`, same `@Transactional` patterns. ShardingSphere
-makes the routing decision via SQL parsing. A small bridge translates
-between the two.
+- `read-write-seperation-library` is removed from `pom.xml`.
+- Annotations (`@ForceMasterRead`, `@StickyRead`), routing context, and
+  aspects all live in this module (~250 LOC, one package).
+- Same call-site code, same `@Transactional` patterns, same test expectations.
+- `mvn test → Tests run: 15, Failures: 0, Errors: 0`.
 
-Result: every scenario in the 15-test matrix passes, including the ones
-that don't currently work in production (read-routing to replica,
-read-your-own-write across threads, etc.).
+## Why this branch exists
+
+The `main` branch demonstrates the **hybrid** integration: keep the in-house
+library's annotation surface and ThreadLocal model, swap its broken
+`RoutingDataSource` engine for ShardingSphere underneath, with two aspects
+bridging the two. The argument was "the library brings useful API surface;
+ShardingSphere just replaces the broken engine."
+
+This branch tests a stronger claim: **the API surface itself is small enough
+that the library doesn't have to exist as a dependency**. ShardingSphere
+provides the routing primitive (`HintManager.setWriteRouteOnly()` +
+SQL-aware DataSource); the annotations, the sticky-window state, and the
+aspects that connect them are ~250 LOC that can live anywhere — in this
+module, in a thin extras JAR, or directly in a consumer service.
+
+If consumer services already depend on the library, this is the migration
+target: drop the library version range entirely, copy these ~7 files into
+either a new shared module or into each service.
+
+## Architecture (this branch)
 
 ```
-mvn test     →    Tests run: 15, Failures: 0, Errors: 0
-```
-
----
-
-## What's actually happening
-
-```
-       Application code  (uses library annotations as before)
-                   │
-                   ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │  In-house library — intent layer (unchanged)            │
-   │   • @ForceMasterRead → RoutingContextHolder.FORCE_MASTER│
-   │   • @StickyRead      → StickyReadContext.windowMs       │
-   │   • StickyWriteContext.lastWriteTime (JVM-static)       │
-   └─────────────────────────────────────────────────────────┘
-                   │
-                   ▼   HintManagerBridgeAspect  (the bridge)
-                   │   reads library ThreadLocals →
-                   │   emits HintManager.setWriteRouteOnly()
-                   ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │  ShardingSphere — mechanism layer                       │
-   │   • @Primary DataSource                                 │
-   │   • SQL parser: SELECT → read_ds, DML → write_ds        │
-   │   • Honors HintManager hints as a write-only override   │
-   └─────────────────────────────────────────────────────────┘
-                   │
-                   ▼
+        Application code  (uses local annotations as before)
+                    │
+                    ▼
+    ┌──────────────────────────────────────────────────────────┐
+    │  tech.vegapay.routingpoc.routing  (this module, ~250 LOC) │
+    │   • @ForceMasterRead  → RoutingContext.forceMaster         │
+    │   • @StickyRead       → RoutingContext.stickyReadOverride  │
+    │   • RoutingContext.lastWriteTime (static volatile, JVM-wide) │
+    │   • ForceMasterReadAspect / StickyReadAspect drive ThreadLocals │
+    │   • StickyWriteRecorderAspect refreshes lastWriteTime        │
+    │   • HintManagerBridgeAspect: ThreadLocal → HintManager hint  │
+    └──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+    ┌──────────────────────────────────────────────────────────┐
+    │  Apache ShardingSphere-JDBC 5.4.1                        │
+    │   • @Primary DataSource                                  │
+    │   • SQL parser: SELECT → read_ds, DML → write_ds         │
+    │   • HintManager.setWriteRouteOnly() overrides to write   │
+    │   • transactionalReadQueryStrategy: PRIMARY              │
+    └──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
             primary DB   |   replica DB
 ```
 
-Two new aspects make the integration work. Both are small (~50 LOC each)
-and would move into the library itself in a productionized version:
+## What's in `tech.vegapay.routingpoc.routing`
 
-- **`HintManagerBridgeAspect`** — `@Around` on every Spring Data repository
-  method. Reads the library's ThreadLocals (`isForceMaster()`,
-  `StickyReadContext`, `StickyWriteContext`). When any signal says "pin to
-  primary", opens a `HintManager` for the call.
-- **`StickyWriteRecorderAspect`** — `@AfterReturning` on repository
-  `save*` / `delete*` / `@Modifying`. Calls `StickyWriteContext.markWrite()`
-  (registered as `afterCommit` synchronization if a Spring tx is active,
-  invoked directly otherwise). This is the piece that makes the sticky
-  window actually have a `lastWriteTime` to compare against.
+```
+routing/
+├── annotation/
+│   ├── ForceMasterRead.java       ← pin reads in method/class scope to primary
+│   └── StickyRead.java            ← widen sticky window for this thread (ms)
+├── context/
+│   └── RoutingContext.java        ← forceMaster ThreadLocal +
+│                                     stickyReadOverride ThreadLocal +
+│                                     lastWriteTime static volatile
+├── aspect/
+│   ├── ForceMasterReadAspect.java ← @Around on @ForceMasterRead → set/clear ThreadLocal
+│   ├── StickyReadAspect.java      ← @Around on @StickyRead → set/restore override
+│   ├── StickyWriteRecorderAspect.java
+│   │                              ← @AfterReturning on save*/delete*/@Modifying
+│   │                                → registers afterCommit (or autocommit-marks)
+│   │                                  RoutingContext.markWrite()
+│   └── HintManagerBridgeAspect.java
+│                                  ← @Around on every Spring Data repo method
+│                                    → if forceMaster OR within sticky window:
+│                                      open HintManager + setWriteRouteOnly()
+└── config/
+    └── StickyWriteProperties.java ← @ConfigurationProperties
+                                     spring.datasource.routing.sticky-writes.*
+```
 
----
+`RoutingContext` collapses the library's three holder classes
+(`RoutingContextHolder` / `StickyReadContext` / `StickyWriteContext`) into
+one — they're all read at the same call site (the bridge aspect), so there's
+no reason to split them.
 
-## Why ShardingSphere
+## What changed vs `main`
 
-ShardingSphere-JDBC is an Apache project that does read/write splitting by
-parsing each SQL statement at execution time (after Spring has finished
-setting up the transaction context, which is the part that matters).
-Compared to building the routing engine in-house:
+```
+Removed
+  pom.xml                                ← drop tech.vegapay.readwriteseperationlibrary dep
+  src/main/.../hybrid/                   ← whole package retired
+  src/test/.../hybrid/                   ← whole package retired
+  LIBRARY_INTEGRATION.md                 ← hybrid-specific doc, no longer applies here
 
-- SQL-aware out of the box: handles `SELECT … FOR UPDATE` from `@Lock`,
-  native queries, JOINs, INSERT/UPDATE/DELETE — without case-by-case logic.
-- Configured via one YAML block. Two URLs in, one routing DataSource out.
-- Same JDBC contract as any other DataSource — JPA, Hibernate, Spring
-  Boot all consume it without modification.
+Added
+  src/main/java/tech/vegapay/routingpoc/routing/        ← new local routing package
+  src/main/java/tech/vegapay/routingpoc/UserService.java ← service surface
+  src/test/java/tech/vegapay/routingpoc/routing/        ← test config + integration test
 
-It doesn't ship sticky-window read-your-own-write or any annotation
-surface, which is why we keep the in-house library on top. Use each tool
-for what it's good at.
+Modified
+  README.md                              ← describes this branch's variant
+  TESTING.md                             ← refreshed to reference local classes
+```
 
----
+Net change: library dependency dropped, ~250 LOC added in `routing/`,
+test-side reset got 8 lines shorter (no more reflection on the library's
+private static field).
 
-## Test harness
+## Quiet correctness fix
 
-Two real Postgres containers (Testcontainers), identical schema, different
-marker data:
+The library's `StickyReadAspect` uses `@Before` and never clears the
+override ThreadLocal — the value leaks until something else overwrites or
+clears it. This branch's `StickyReadAspect` uses `@Around` and restores the
+prior override in `finally`, so per-thread sticky-read state is properly
+scoped to the annotated method. Not a behavior change for the 15-scenario
+matrix (the test resets between scenarios), but worth noting if call-site
+code starts nesting `@StickyRead` methods.
 
-| | Primary container | Replica container |
+## Trade-offs vs the hybrid (`main`)
+
+| Concern | Hybrid (main) | ShardingSphere-only (this branch) |
 |---|---|---|
-| Connection user | `app` (table owner, full privs) | `readonly_app` (`SELECT` only) |
-| `users.served_by` value | `'PRIMARY'` on every row | `'REPLICA'` on every row |
-| Write attempt would | succeed | throw `permission denied for table users` |
-
-Every read in a test asserts which DB served it by looking at the
-`served_by` marker. Writes are verified via a side-channel `JdbcTemplate`
-that talks directly to the primary container. Misrouted writes fail
-loudly — there is no silent stale-read failure mode.
-
-See [TESTING.md](TESTING.md) for the scenario-by-scenario walkthrough.
-
----
-
-## Layout
-
-```
-src/
-├── main/java/tech/vegapay/routingpoc/
-│   ├── RoutingPocApplication.java       ← @SpringBootApplication + @EnableAsync
-│   ├── User.java                        ← entity with the served_by marker column
-│   ├── UserRepo.java                    ← every query shape the matrix exercises
-│   └── hybrid/
-│       ├── HybridUserService.java       ← service surface, uses library annotations
-│       ├── HintManagerBridgeAspect.java ← reads library ThreadLocals → emits HintManager
-│       └── StickyWriteRecorderAspect.java ← refreshes StickyWriteContext.lastWriteTime
-└── test/
-    ├── java/tech/vegapay/routingpoc/hybrid/
-    │   ├── ShardingSphereTestConfig.java  ← builds the ShardingSphere DataSource
-    │   ├── HybridTestConfig.java          ← @Imports library aspects + the bridge
-    │   └── HybridRoutingIntegrationTest.java
-    └── resources/
-        ├── application-test.yml
-        └── init/
-            ├── primary.sql                ← 'PRIMARY' marker rows
-            └── replica.sql                ← 'REPLICA' rows + readonly_app role
-```
-
----
+| External dep | `read-write-seperation-library` 2.0.1+ | none beyond ShardingSphere |
+| Annotation surface | library-owned | local to this module |
+| Sticky-window scope | JVM-global (library's static) | JVM-global (this module's static) |
+| Scenarios passing | 15/15 | 15/15 (including 8, 13, 14 sticky scenarios) |
+| Scenario 5 (`@Transactional(readOnly=true) → PRIMARY`) | unfixed | unfixed (same `transactionalReadQueryStrategy=PRIMARY` trade-off) |
+| Migration cost from in-house engine | library version bump | drop library dep, copy 8 files in once |
 
 ## Running
 
 ```
 cd /Users/dwivedi_utkarsh/Vegapay/read-write-routing-poc
+git checkout shardingsphere-only
 mvn test
 ```
 
-Requires Docker. First run pulls `postgres:14` (~1–2 min); subsequent
-runs take ~30 s.
+Requires Docker. First run pulls `postgres:14` (~1–2 min); subsequent runs
+take ~30 s. No local-Maven install of `read-write-seperation-library` is
+required on this branch.
 
----
+## Dependencies (this branch)
 
-## Dependencies
-
-- Spring Boot 2.7.18, Java 11 — matches LOS / onboarding / credential-manager / library
+- Spring Boot 2.7.18, Java 11
 - Apache ShardingSphere-JDBC 5.4.1
 - Testcontainers 1.21.3
-- `tech.vegapay.readwriteseperationlibrary:read-write-seperation-library:2.0.1-SNAPSHOT`
-  — `mvn install -DskipTests` from `vegapay-library/read-write-seperation-library` if not in local repo
 
----
+(No `tech.vegapay.readwriteseperationlibrary` line in `pom.xml`.)
 
-## Toward production
+## Files to look at first
 
-The POC has all the moving parts. To ship, they move from this test
-module into the library itself. See [LIBRARY_INTEGRATION.md](LIBRARY_INTEGRATION.md)
-for the file-by-file walkthrough — which library files stay untouched,
-which two new files get added, what gets replaced in
-`DataSourceRoutingConfig`, what gets deleted, and the dependency bump.
+1. `src/main/java/tech/vegapay/routingpoc/routing/aspect/HintManagerBridgeAspect.java`
+   — the actual bridge: one place that reads RoutingContext and decides
+   whether to pin.
+2. `src/main/java/tech/vegapay/routingpoc/routing/context/RoutingContext.java`
+   — the entire routing state model, ~60 LOC.
+3. `src/test/java/tech/vegapay/routingpoc/routing/RoutingIntegrationTest.java`
+   — the 15-scenario matrix. Per-scenario expectations are unchanged from
+   `main`.
 
-Consumer services (LOS, onboarding, credential-manager) migrate by
-bumping the library version. No code changes at call sites. The same
-`spring.datasource.write.*` / `spring.datasource.read.*` properties they
-already set drive ShardingSphere instead of the broken `RoutingDataSource`.
+## Relation to `main`
+
+The `main` branch documents the **hybrid** approach — ShardingSphere as the
+engine, the in-house `read-write-seperation-library` retained as the
+annotation surface and ThreadLocal contract, with two bridge aspects
+translating between them. That path is a valid migration target if your
+services already depend on the library.
+
+This branch demonstrates the stronger claim that the library itself is
+not load-bearing: the routing module is small enough to ship inside each
+consumer (or as one shared `routing-extras` module) directly. The two
+paths are not mutually exclusive — pick whichever has the lower migration
+cost for your services. Either way, the routing primitives live above
+ShardingSphere, not inside it.
