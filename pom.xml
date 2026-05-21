@@ -52,29 +52,16 @@
             <artifactId>postgresql</artifactId>
         </dependency>
 
-        <dependency>
-            <groupId>org.apache.shardingsphere</groupId>
-            <artifactId>shardingsphere-jdbc-core</artifactId>
-            <version>${shardingsphere.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-simple</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-
         <!--
-            In-house read/write library. Used by the Hybrid variant only; its
-            DataSourceRoutingConfig is gated on spring.datasource.routing.enabled
-            so leaving that property unset keeps the library's RoutingDataSource
-            dormant and lets ShardingSphere remain the @Primary DataSource. We
-            consume only the library's annotations, aspects, and StickyWriteContext.
+            In-house read/write library 3.0.0+ has ShardingSphere wired
+            internally. Consumer services configure spring.datasource.write/read.*
+            and set spring.datasource.routing.enabled=true; the library handles
+            the rest. ShardingSphere comes in transitively.
         -->
         <dependency>
             <groupId>tech.vegapay.readwriteseperationlibrary</groupId>
             <artifactId>read-write-seperation-library</artifactId>
-            <version>2.0.1-SNAPSHOT</version>
+            <version>3.0.0-SNAPSHOT</version>
         </dependency>
 
         <dependency>

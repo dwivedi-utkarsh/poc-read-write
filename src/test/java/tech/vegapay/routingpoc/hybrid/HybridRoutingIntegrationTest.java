@@ -10,9 +10,10 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -31,32 +32,45 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
- * Hybrid run of the 15-scenario routing matrix. ShardingSphere does the
- * routing decisions; the in-house read-write-seperation-library contributes
- * its annotations and sticky-window logic via HintManagerBridgeAspect +
- * StickyWriteRecorderAspect.
+ * 15-scenario routing matrix validating the productionized
+ * read-write-seperation-library 3.0.0+. The library auto-configures
+ * itself via spring.factories: it reads spring.datasource.write/read.*
+ * + spring.datasource.routing.enabled, builds the ShardingSphereDataSource
+ * internally, and registers the four aspects
+ * (ForceMasterRead, StickyRead, HintManagerBridge, StickyWriteRecorder).
  *
- * Compare side-by-side with {@link tech.vegapay.routingpoc.ShardingSphereRoutingIntegrationTest}.
- * Scenarios where the expectation differs from that file are the value-add of
- * the hybrid wiring:
+ * Compared to the old hybrid test, this class:
+ *   - Imports nothing library-internal (no @Import of test configs)
+ *   - Feeds connection details to the library via @DynamicPropertySource
+ *   - Has no POC-side ShardingSphere wiring — the library owns it
  *
- *   - Scenario 8:  REPLICA → PRIMARY (sticky window now active)
- *   - Scenario 12: PRIMARY (annotation, not HintManager call)
- *   - Scenario 13: PRIMARY (annotation, not HintManager call)
- *   - Scenario 14: REPLICA → PRIMARY (JVM-global sticky propagates to @Async)
- *
- * Scenario 5 (@Transactional(readOnly=true)) still routes to PRIMARY — that
- * one needs a config or call-site change, not something the hybrid can fix at
- * the aspect layer.
+ * Mirrors the consumer-service integration contract exactly: add the dep,
+ * set the properties, done.
  */
 @SpringBootTest(classes = {
         RoutingPocApplication.class,
         HybridRoutingIntegrationTest.ContainersConfig.class
 })
-@Import(HybridTestConfig.class)
 @ActiveProfiles("test")
 @Testcontainers
 class HybridRoutingIntegrationTest {
+
+    @DynamicPropertySource
+    static void wireDataSourceProperties(DynamicPropertyRegistry registry) {
+        if (!primary.isRunning()) primary.start();
+        if (!replica.isRunning()) replica.start();
+        registry.add("spring.datasource.write.url", primary::getJdbcUrl);
+        registry.add("spring.datasource.write.username", primary::getUsername);
+        registry.add("spring.datasource.write.password", primary::getPassword);
+        registry.add("spring.datasource.write.driver-class-name", () -> "org.postgresql.Driver");
+        registry.add("spring.datasource.read.url", replica::getJdbcUrl);
+        registry.add("spring.datasource.read.username", () -> "readonly_app");
+        registry.add("spring.datasource.read.password", () -> "readonly");
+        registry.add("spring.datasource.read.driver-class-name", () -> "org.postgresql.Driver");
+        registry.add("spring.datasource.routing.enabled", () -> "true");
+        registry.add("spring.datasource.routing.sticky-writes.enabled", () -> "true");
+        registry.add("spring.datasource.routing.sticky-writes.window-ms", () -> "5000");
+    }
 
     private static final UUID ALICE = UUID.fromString("11111111-1111-1111-1111-111111111111");
     private static final String ALICE_EMAIL = "alice@example.com";
