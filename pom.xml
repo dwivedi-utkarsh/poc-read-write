@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>tech.vegapay.poc</groupId>
+    <artifactId>read-write-routing-poc</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>read-write-routing-poc</name>
+    <description>
+        POC harness for evaluating read/write routing approaches against two real Postgres
+        instances (Testcontainers). This module currently exercises Approach D:
+        Apache ShardingSphere-JDBC read/write splitting as a drop-in replacement for the
+        in-house read-write-seperation-library.
+    </description>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.18</version>
+        <relativePath/>
+    </parent>
+
+    <properties>
+        <java.version>11</java.version>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <shardingsphere.version>5.4.1</shardingsphere.version>
+        <testcontainers.version>1.21.3</testcontainers.version>
+        <!-- ShardingSphere 5.4 requires SnakeYAML >=1.32 (LoaderOptions#setCodePointLimit). -->
+        <snakeyaml.version>1.33</snakeyaml.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.shardingsphere</groupId>
+            <artifactId>shardingsphere-jdbc-core</artifactId>
+            <version>${shardingsphere.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-simple</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!--
+            In-house read/write library. Used by the Hybrid variant only; its
+            DataSourceRoutingConfig is gated on spring.datasource.routing.enabled
+            so leaving that property unset keeps the library's RoutingDataSource
+            dormant and lets ShardingSphere remain the @Primary DataSource. We
+            consume only the library's annotations, aspects, and StickyWriteContext.
+        -->
+        <dependency>
+            <groupId>tech.vegapay.readwriteseperationlibrary</groupId>
+            <artifactId>read-write-seperation-library</artifactId>
+            <version>2.0.1-SNAPSHOT</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!--
+                        Testcontainers + docker-java pins Docker API v1.32 by default, but
+                        recent Docker Desktop (>= 28.x) dropped support for anything below
+                        v1.40. Override here so the build works without per-invocation env vars.
+                        DOCKER_HOST is also pinned to Docker Desktop's user socket because the
+                        global /var/run/docker.sock symlink occasionally yields empty /info
+                        responses during testcontainers' strategy probe.
+                    -->
+                    <environmentVariables>
+                        <DOCKER_HOST>unix://${user.home}/.docker/run/docker.sock</DOCKER_HOST>
+                    </environmentVariables>
+                    <systemPropertyVariables>
+                        <api.version>1.43</api.version>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

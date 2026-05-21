@@ -1,0 +1,31 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+        show_sql: false
+    open-in-view: false
+  main:
+    banner-mode: off
+  datasource:
+    routing:
+      # Library's RoutingDataSource is gated on routing.enabled. We deliberately
+      # leave it unset / false so ShardingSphere remains the @Primary DataSource;
+      # only the library's annotations and StickyWriteContext are in play.
+      sticky-writes:
+        # Used by HintManagerBridgeAspect via StickyWriteProperties — read the
+        # JVM-global lastWriteTime and pin the next reads to primary for this
+        # many milliseconds.
+        enabled: true
+        window-ms: 5000
+
+logging:
+  level:
+    root: WARN
+    tech.vegapay.routingpoc: INFO
+    org.apache.shardingsphere: WARN
+    org.springframework.transaction: WARN
+    org.hibernate.SQL: WARN
