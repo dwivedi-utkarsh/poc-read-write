@@ -25,6 +25,7 @@ import tech.vegapay.routingpoc.User;
 import tech.vegapay.routingpoc.UserRepo;
 
 import java.lang.reflect.Field;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -136,6 +137,9 @@ class HybridRoutingIntegrationTest {
 
     @Autowired
     HybridUserService svc;
+
+    @Autowired
+    ClassLevelForceMasterService classLevelForce;
 
     @Autowired
     @Qualifier("primaryJdbc")
@@ -370,6 +374,286 @@ class HybridRoutingIntegrationTest {
                 .doesNotThrowAnyException();
         assertThat(countByEmail(primaryJdbc, newEmail)).isEqualTo(1L);
         assertThat(countByEmail(replicaJdbc, newEmail)).isEqualTo(0L);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 16 — count() routes to PRIMARY
+    //
+    // Inherited JpaRepository methods (count, existsById, findAll, etc.) are
+    // wrapped by Spring Data in a class-level @Transactional(readOnly=true).
+    // ShardingSphere with transactionalReadQueryStrategy=PRIMARY pins reads
+    // inside any open JDBC tx to write_ds. Same trade-off as scenario 5.
+    //
+    // Detection: insert a throwaway row directly on primary, count before
+    // and after — if count routes to primary, it sees the row.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("16: count() routes to PRIMARY (Spring Data wraps inherited methods in @Transactional(readOnly))")
+    void scenario16_count_routesToPrimary() {
+        long before = svc.countAll();
+        UUID throwaway = UUID.randomUUID();
+        primaryJdbc.update("INSERT INTO users (id, email, served_by) VALUES (?, ?, 'PRIMARY')",
+                throwaway, "s16-" + throwaway);
+        long after = svc.countAll();
+        primaryJdbc.update("DELETE FROM users WHERE id = ?", throwaway);
+        assertThat(after).isEqualTo(before + 1L);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 17 — existsById() routes to PRIMARY
+    // Same reason as scenario 16. Detection: insert a row only on primary,
+    // exists must return true (replica would return false).
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("17: existsById() routes to PRIMARY (same Spring Data tx wrap)")
+    void scenario17_existsById_routesToPrimary() {
+        UUID primaryOnly = UUID.randomUUID();
+        primaryJdbc.update("INSERT INTO users (id, email, served_by) VALUES (?, ?, 'PRIMARY')",
+                primaryOnly, "s17-" + primaryOnly);
+        try {
+            assertThat(svc.exists(primaryOnly)).isTrue();
+        } finally {
+            primaryJdbc.update("DELETE FROM users WHERE id = ?", primaryOnly);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 18 — findAll(Pageable) routes to PRIMARY
+    //
+    // Same reason as 16/17. The page query emits TWO statements (a SELECT
+    // and a count(*) for total pages); both are pinned to primary by the
+    // wrapping read-only tx.
+    //
+    // Detection: marker column on the first returned row.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("18: findAll(Pageable) routes to PRIMARY (page SELECT + count both pinned)")
+    void scenario18_findAllPageable_routesToPrimary() {
+        assertThat(svc.pageFirstRowServedBy()).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 19 — saveAll(batch) outside tx → PRIMARY
+    // Every row in the batch routes to primary, and the sticky-write recorder
+    // refreshes lastWriteTime so a subsequent read also goes to primary.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("19: saveAll(batch) outside tx → PRIMARY")
+    void scenario19_saveAllBatch_outsideTx_routesToPrimary() {
+        UUID id1 = UUID.randomUUID();
+        UUID id2 = UUID.randomUUID();
+        User u1 = new User(); u1.setId(id1); u1.setEmail("s19-a-" + id1); u1.setServedBy("PRIMARY");
+        User u2 = new User(); u2.setId(id2); u2.setEmail("s19-b-" + id2); u2.setServedBy("PRIMARY");
+        assertThatCode(() -> svc.saveAllUsers(List.of(u1, u2))).doesNotThrowAnyException();
+        assertThat(countById(primaryJdbc, id1)).isEqualTo(1L);
+        assertThat(countById(primaryJdbc, id2)).isEqualTo(1L);
+        assertThat(countById(replicaJdbc, id1)).isEqualTo(0L);
+        // Sticky window refreshed → immediate read goes to primary.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 20 — deleteById() outside tx → PRIMARY
+    // Recorder fires; subsequent read in sticky window goes to primary.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("20: deleteById() outside tx → PRIMARY")
+    void scenario20_deleteById_outsideTx_routesToPrimary() {
+        // Insert a throwaway row on primary so deleteById has something to remove.
+        UUID id = UUID.randomUUID();
+        primaryJdbc.update("INSERT INTO users (id, email, served_by) VALUES (?, ?, 'PRIMARY')",
+                id, "s20-" + id);
+        assertThatCode(() -> svc.deleteOne(id)).doesNotThrowAnyException();
+        assertThat(countById(primaryJdbc, id)).isEqualTo(0L);
+        // Sticky window refreshed by the delete.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 21 — Rolled-back tx with write inside → next read → REPLICA
+    //
+    // Critical correctness test. The write happens, then a RuntimeException
+    // rolls back the tx. afterCommit synchronization MUST NOT fire on
+    // rollback, so StickyWriteContext.lastWriteTime is NOT refreshed. A read
+    // immediately after the rolled-back tx goes to replica because no
+    // sticky-write was recorded.
+    //
+    // A regression here would mean writes that didn't actually happen still
+    // pin reads to primary — wasted capacity at best, masking of replication
+    // delays at worst.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("21: rolled-back tx with write inside → next read REPLICA (afterCommit skipped)")
+    void scenario21_rolledBackTx_doesNotMarkSticky() {
+        assertThatCode(() -> svc.writeThenRollback(ALICE))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("simulated rollback");
+        // The UPDATE was rolled back; alice's email on primary is unchanged.
+        assertThat(emailOnPrimary(ALICE)).isEqualTo(ALICE_EMAIL);
+        // lastWriteTime was not refreshed → read goes to replica.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("REPLICA");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 22 — @Transactional(REQUIRES_NEW) inner tx → PRIMARY
+    //
+    // Outer @Transactional + inner REQUIRES_NEW on a different bean opens a
+    // fresh JDBC tx. ShardingSphere's transactionalReadQueryStrategy=PRIMARY
+    // pins reads in any open JDBC tx — including this new inner one.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("22: REQUIRES_NEW inner tx → PRIMARY (tx pinning applies to new tx)")
+    void scenario22_requiresNewInnerTx_routesToPrimary() {
+        assertThat(svc.outerThenRequiresNew(ALICE)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 23 — Hibernate dirty-check UPDATE → routes PRIMARY
+    //
+    // Two things to verify (and one known gap):
+    //   - The dirty-check UPDATE itself routes to primary (ShardingSphere
+    //     parses UPDATE → write_ds regardless of whether the caller used
+    //     save() or just mutated the entity inside a tx).
+    //   - The sticky-write recorder DOES NOT see this code path: its
+    //     pointcut is save*/delete*/@Modifying, none of which fire here.
+    //     So a subsequent read outside the tx goes to replica even though
+    //     a write just happened. This is a known coverage gap; documented.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("23: Hibernate dirty-check UPDATE → PRIMARY (sticky recorder doesn't see it — documented gap)")
+    void scenario23_dirtyCheckUpdate_routesToPrimary_butStickyNotRefreshed() {
+        assertThatCode(() -> svc.dirtyCheckUpdate(ALICE)).doesNotThrowAnyException();
+        // UPDATE landed on primary (the email changed there, not on replica
+        // which is read-only).
+        assertThat(emailOnPrimary(ALICE)).startsWith("dirty-");
+        // Known gap: recorder didn't fire because no save()/delete()/@Modifying.
+        // A subsequent read goes to replica despite the just-committed write.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("REPLICA");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 24 — Application code holds its own HintManager
+    //
+    // The bridge aspect tries getInstance() and catches IllegalStateException
+    // (HintManager already open on this thread). It does not fight the caller,
+    // simply proceeds — the caller's hint stays in force.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("24: app code already holds HintManager → bridge respects it → PRIMARY")
+    void scenario24_applicationHeldHint_bridgeDoesNotFight() {
+        assertThat(svc.readWithApplicationHeldHint(ALICE_EMAIL)).isEqualTo("PRIMARY");
+        // After the method returns, the application closed its HintManager
+        // and force-master is not active. Next read flows to replica.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("REPLICA");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 25 — @ForceMasterRead method throws → HintManager closed; no leak
+    //
+    // Critical robustness test. A repo call inside an @ForceMasterRead method
+    // throws (orElseThrow on Optional.empty). The bridge's finally{} closes
+    // HintManager; the outer ForceMasterReadAspect's finally{} clears the
+    // ThreadLocal. Subsequent reads on the same pooled thread are not pinned.
+    //
+    // A regression would mean pooled threads bleed force-master state into
+    // unrelated requests — every read on this thread until JVM shutdown
+    // gets incorrectly pinned to primary.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("25: @ForceMasterRead method throws → next read REPLICA (no thread state leak)")
+    void scenario25_forceMasterThrows_doesNotLeakHint() {
+        UUID nonExistent = UUID.randomUUID();
+        assertThatCode(() -> svc.forceMasterButThrows(nonExistent))
+                .isInstanceOf(RuntimeException.class);
+        // Same thread, immediately after the throw: routing must be back to
+        // default. No HintManager open, no ThreadLocal force-master flag.
+        assertThat(svc.plainRead(ALICE_EMAIL)).isEqualTo("REPLICA");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 26 — Sticky window refresh: second write extends the window
+    //
+    // Timeline:
+    //   t=0     write 1   → lastWriteTime = 0
+    //   t=3s    write 2   → lastWriteTime = 3s
+    //   t=5.5s  read      → elapsed = 2.5s (from write 2) ≤ 5s → PRIMARY
+    //   t=8.5s  read      → elapsed = 5.5s (from write 2) > 5s → REPLICA
+    //
+    // Verifies the refresh-on-newer-write semantics. Otherwise a long-running
+    // session of writes would expire the window between writes even though
+    // there's continuous write activity.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("26: sticky window refresh — second write extends window")
+    void scenario26_stickyWindowRefresh_secondWriteExtendsWindow() throws InterruptedException {
+        // Write to alice (changes alice's email), then read bob (never mutated,
+        // so findByEmail(BOB_EMAIL) still resolves on both DSes and the
+        // returned served_by marker tells us which one served the SELECT).
+        svc.plainWrite(ALICE);                             // t=0
+        TimeUnit.MILLISECONDS.sleep(3000);
+        svc.plainWrite(ALICE);                             // t=3s
+        TimeUnit.MILLISECONDS.sleep(2500);                 // t=5.5s
+        assertThat(svc.plainRead(BOB_EMAIL)).isEqualTo("PRIMARY");
+        TimeUnit.MILLISECONDS.sleep(3000);                 // t=8.5s
+        assertThat(svc.plainRead(BOB_EMAIL)).isEqualTo("REPLICA");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 27 — Class-level @ForceMasterRead → PRIMARY
+    //
+    // ForceMasterReadAspect's pointcut is "@annotation OR @within" — the
+    // @within clause matches annotations placed on the enclosing class. A
+    // method on a class-annotated bean must still pin reads to primary.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("27: class-level @ForceMasterRead → PRIMARY (@within pointcut)")
+    void scenario27_classLevelForceMasterRead_routesToPrimary() {
+        assertThat(classLevelForce.readByEmail(ALICE_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 28 — @StickyRead(0) falls back to the property default
+    //
+    // The annotation's value=0 (default) means "use the global window from
+    // properties." Effective window resolves to stickyProps.windowMs (5000).
+    // With a recent write, this should behave like the implicit sticky case.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("28: @StickyRead with value=0 falls back to property default → PRIMARY")
+    void scenario28_stickyReadZero_fallsBackToPropertyDefault() {
+        svc.plainWriteOutsideTx(ALICE, "s28-prep-" + UUID.randomUUID() + "@example.com");
+        assertThat(svc.stickyReadDefaultWindow(BOB_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 29 — Cross-thread sticky via raw Thread (not @Async)
+    //
+    // The async scenario (14) uses Spring's @Async executor; this one spawns
+    // a raw new Thread() instead. Behavior should be identical because the
+    // sticky propagation mechanism is JVM-global, not framework-specific.
+    // Proves the design works for any thread, not just @Async / Kafka.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("29: raw Thread read after parent write → PRIMARY (JVM-global sticky)")
+    void scenario29_rawThreadReadAfterParentWrite_routesToPrimary() throws Exception {
+        assertThat(svc.crossThreadReadAfterWrite(ALICE, BOB_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 30 — TransactionTemplate.execute() → reads inside → PRIMARY
+    //
+    // Some legacy code uses programmatic tx (TransactionTemplate) instead of
+    // @Transactional. The library doesn't need to care — ShardingSphere's
+    // transactionalReadQueryStrategy=PRIMARY applies to any open JDBC tx.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("30: TransactionTemplate.execute() → reads inside → PRIMARY")
+    void scenario30_transactionTemplateRead_routesToPrimary() {
+        assertThat(svc.transactionTemplateRead(ALICE_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    private String emailOnPrimary(UUID id) {
+        return primaryJdbc.queryForObject("SELECT email FROM users WHERE id = ?", String.class, id);
     }
 
     private static Long countByEmail(JdbcTemplate jt, String email) {
