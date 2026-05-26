@@ -26,6 +26,7 @@ import tech.vegapay.routingpoc.UserRepo;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -71,6 +72,12 @@ class HybridRoutingIntegrationTest {
         registry.add("spring.datasource.routing.enabled", () -> "true");
         registry.add("spring.datasource.routing.sticky-writes.enabled", () -> "true");
         registry.add("spring.datasource.routing.sticky-writes.window-ms", () -> "5000");
+        // Scenario 31 — set distinct pool sizes per side so the plumbing test
+        // can detect them on the underlying HikariDataSource instances.
+        registry.add("spring.datasource.write.hikari.maximum-pool-size", () -> "7");
+        registry.add("spring.datasource.write.hikari.minimum-idle", () -> "2");
+        registry.add("spring.datasource.read.hikari.maximum-pool-size", () -> "11");
+        registry.add("spring.datasource.read.hikari.minimum-idle", () -> "3");
     }
 
     private static final UUID ALICE = UUID.fromString("11111111-1111-1111-1111-111111111111");
@@ -148,6 +155,9 @@ class HybridRoutingIntegrationTest {
     @Autowired
     @Qualifier("replicaJdbc")
     JdbcTemplate replicaJdbc;
+
+    @Autowired
+    javax.sql.DataSource routingDataSource;
 
     @BeforeEach
     void resetAliceAndRoutingState() throws Exception {
@@ -650,6 +660,59 @@ class HybridRoutingIntegrationTest {
     @DisplayName("30: TransactionTemplate.execute() → reads inside → PRIMARY")
     void scenario30_transactionTemplateRead_routesToPrimary() {
         assertThat(svc.transactionTemplateRead(ALICE_EMAIL)).isEqualTo("PRIMARY");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Scenario 31 — Hikari pool properties set via application.yml propagate
+    // to the underlying HikariDataSource instances inside ShardingSphere.
+    //
+    // @DynamicPropertySource above sets:
+    //   spring.datasource.write.hikari.maximum-pool-size: 7
+    //   spring.datasource.read.hikari.maximum-pool-size:  11
+    //
+    // The library must plumb these through ShardingSphere's YAML so the
+    // underlying pools honor them. Otherwise services migrating to this
+    // library silently lose their Hikari pool tuning and fall back to
+    // Hikari's defaults — a real regression for production-scale services.
+    // ────────────────────────────────────────────────────────────────────────
+    @Test
+    @DisplayName("31: spring.datasource.{write,read}.hikari.* properties reach the underlying pools")
+    void scenario31_hikariProperties_propagateToUnderlyingPools() throws Exception {
+        Map<String, HikariDataSource> pools = unwrapHikariPools(routingDataSource);
+        HikariDataSource writePool = pools.get("write_ds");
+        HikariDataSource readPool = pools.get("read_ds");
+        assertThat(writePool.getMaximumPoolSize()).isEqualTo(7);
+        assertThat(writePool.getMinimumIdle()).isEqualTo(2);
+        assertThat(readPool.getMaximumPoolSize()).isEqualTo(11);
+        assertThat(readPool.getMinimumIdle()).isEqualTo(3);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, HikariDataSource> unwrapHikariPools(javax.sql.DataSource ds) throws Exception {
+        Field cmField = ds.getClass().getDeclaredField("contextManager");
+        cmField.setAccessible(true);
+        Object contextManager = cmField.get(ds);
+
+        Field dbNameField = ds.getClass().getDeclaredField("databaseName");
+        dbNameField.setAccessible(true);
+        String databaseName = (String) dbNameField.get(ds);
+
+        Map<String, ?> storageUnits = (Map<String, ?>) contextManager.getClass()
+                .getMethod("getStorageUnits", String.class)
+                .invoke(contextManager, databaseName);
+
+        Map<String, HikariDataSource> result = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, ?> entry : storageUnits.entrySet()) {
+            Object storageUnit = entry.getValue();
+            javax.sql.DataSource wrapped = (javax.sql.DataSource) storageUnit.getClass()
+                    .getMethod("getDataSource").invoke(storageUnit);
+            // ShardingSphere wraps each pool in CatalogSwitchableDataSource;
+            // peel the layer off via its public getDataSource().
+            javax.sql.DataSource underlying = (javax.sql.DataSource) wrapped.getClass()
+                    .getMethod("getDataSource").invoke(wrapped);
+            result.put(entry.getKey(), (HikariDataSource) underlying);
+        }
+        return result;
     }
 
     private String emailOnPrimary(UUID id) {
